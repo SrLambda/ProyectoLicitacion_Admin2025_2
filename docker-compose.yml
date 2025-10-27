@@ -1,0 +1,291 @@
+#version docker-compose
+version: '3.8'
+
+
+services:
+  #router
+  gateway:
+   # usa una imagen pre-construida de Docker Hub  
+    image: traefik:v2.10  
+    container_name: gateway    
+    command:
+      # Habilita dashboard de Traefik 
+      # insecure=true: sin autenticacion (solo para desarrollo) cambiar configuracion en futuro
+      - "--api.insecure=true"
+
+      # busca servicios en Docker
+      - "--providers.docker=true"
+      
+      #expone solo servicios que tengan label "traefik.enable=true"
+      - "--providers.docker.exposedbydefault=false"
+      
+      # Todas las peticiones HTTP llegan aquí
+      - "--entrypoints.web.address=:80"
+    
+    ports:
+      - "80:80"        # Puerto web principal
+      - "8080:8080"    # Dashboard de Traefik
+    
+    volumes:
+      # Permite que Traefik vea otros contenedores Docker
+      # :ro = read-only (solo lectura, más seguro)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    
+    environment:
+      # variables de entorno
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      
+      # Nombre de la BD
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      
+      # Usuario(nO root)
+      MYSQL_USER: ${MYSQL_USER}
+      
+      # Contraseña del usuario
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    
+    volumes:
+      #guarda los datos de MySQL en un volumen
+      - mysql-data:/var/lib/mysql
+
+      # Scripts SQL que se ejecutan al crear la BD
+      - ./db/mysql/init:/docker-entrypoint-initdb.d
+    ports:
+      - "3306:3306"
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      # verifica si MySQL está funcionando
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      
+      interval: 10s    
+      timeout: 5s         # Si tarda más de 5s, considera que la db falla
+      retries: 5          # intenta 5 veces antes de marcar como unhealthy
+      start_period: 30s   # espera 30s antes de empezar a verificar
+
+  redis:
+    image: redis:7-alpine    
+    container_name: redis
+
+    # Persistencia de datos
+    command: redis-server --appendonly yes
+    
+    volumes:
+      - redis-data:/data
+    
+    ports:
+      - "6379:6379"
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  autenticacion:
+    build:
+      context: ./backend/autenticacion
+          
+    container_name: autenticacion
+    
+    environment:
+      - FLASK_APP=app/app.py
+      - FLASK_ENV=development 
+
+      # URL de conexión a MySQL     
+      - DATABASE_URL=mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      
+        # Base de datos 0 de Redis
+      - REDIS_URL=redis://redis:6379/0
+      
+      # Clave para firmar tokens JWT
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      
+    
+    volumes:
+      - ./backend/autenticacion:/app
+    
+    labels:
+      #codigo para la conexion con traefic (gateway)
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth.rule=PathPrefix(`/api/auth`)"
+      - "traefik.http.middlewares.auth-strip.stripprefix.prefixes=/api/auth"
+      - "traefik.http.routers.auth.middlewares=auth-strip"      
+      - "traefik.http.services.auth.loadbalancer.server.port=8000"
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    depends_on:
+      mysql:
+        # no inicia hasta que MySQL esté "healthy"
+        condition: service_healthy
+      
+      redis:
+        # Espera que Redis esté iniciado 
+        condition: service_started
+
+  casos:
+    build:
+      context: ./backend/casos
+    container_name: casos
+    environment:
+      - FLASK_APP=app/app.py
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      #  Base de datos 1 de Redis 
+      - REDIS_URL=redis://redis:6379/1
+    volumes:
+      - ./backend/casos:/app
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.casos.rule=PathPrefix(`/api/casos`)"
+      - "traefik.http.middlewares.casos-strip.stripprefix.prefixes=/api/casos"
+      - "traefik.http.routers.casos.middlewares=casos-strip"
+      - "traefik.http.services.casos.loadbalancer.server.port=8001"
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  documentos:
+    build:
+      context: ./backend/documentos
+    container_name: documentos
+    environment:
+      - FLASK_APP=app/app.py
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      - UPLOAD_FOLDER=/app/uploads
+      # Carpeta donde se guardan los PDFs subidos
+    volumes:
+      - ./backend/documentos:/app
+      - documentos-uploads:/app/uploads
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.docs.rule=PathPrefix(`/api/documentos`)"
+      - "traefik.http.middlewares.docs-strip.stripprefix.prefixes=/api/documentos"
+      - "traefik.http.routers.docs.middlewares=docs-strip"
+      - "traefik.http.services.docs.loadbalancer.server.port=8002"
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  notificaciones:
+    build:
+      context: ./backend/notificaciones
+    container_name: notificaciones
+    environment:
+      - FLASK_APP=app/app.py
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      - REDIS_URL=redis://redis:6379/2
+      - MAIL_SERVER=${MAIL_SERVER}
+      # Servidor SMTP para enviar emails
+      - MAIL_PORT=${MAIL_PORT}
+      - MAIL_USERNAME=${MAIL_USERNAME}
+      - MAIL_PASSWORD=${MAIL_PASSWORD}
+    volumes:
+      - ./backend/notificaciones:/app
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.notif.rule=PathPrefix(`/api/notificaciones`)"
+      - "traefik.http.middlewares.notif-strip.stripprefix.prefixes=/api/notificaciones"
+      - "traefik.http.routers.notif.middlewares=notif-strip"
+      - "traefik.http.services.notif.loadbalancer.server.port=8003"
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: frontend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`localhost`)"
+      # Regla: CUALQUIER petición a localhost va al frontend
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+      # Nginx sirve los archivos estáticos en puerto 80
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      # Archivo de configuración de Prometheus
+      - prometheus-data:/prometheus
+      # Datos de métricas
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ========== MONITOREO: GRAFANA ==========
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      # ${VAR:-default}: Si no existe VAR, usa "default"
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+networks:
+# Bridge: Red virtual privada para los contenedores
+  app-network:
+    driver: bridge
+    
+
+volumes:
+  # Volúmenes persistentes (datos que NO se pierden al destruir contenedores)
+  mysql-data:           # Datos de MySQL
+  redis-data:           # Datos de Redis
+  documentos-uploads:   # PDFs y archivos subidos
+  prometheus-data:      # Métricas de Prometheus
+  grafana-data:         # Dashboards de Grafana

@@ -1,6 +1,13 @@
+#framework
 Flask==3.0.0
+
+#conexion entre front y back
 Flask-CORS==4.0.0
+
+#sql
 Flask-SQLAlchemy==3.1.1
 mysqlclient==2.2.0
 PyMySQL==1.1.0
+
+#env
 python-dotenv==1.0.0
